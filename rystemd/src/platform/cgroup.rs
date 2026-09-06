@@ -120,9 +120,14 @@ pub fn apply_limits(dir: &Path, l: &CgroupLimits) {
         // cpu.max = "<max> <period>", both in microseconds. systemd targets a
         // 100ms (100000 µs) period; the max is quota × period. f32 → integer
         // math: round up so a budget is never silently under-granted.
-        let period_us: u64 = 100_000;
-        let max_us = (quota * period_us as f32).round() as u64;
-        let _ = write_file(&dir.join("cpu.max"), &format!("{max_us} {period_us}"));
+        // Reject zero (and NaN/negative) explicitly: writing `0 100000` to
+        // cpu.max makes the kernel throttle the cgroup to zero CPU, which
+        // would silently starve every service the unit owns.
+        if quota.is_finite() && quota > 0.0 {
+            let period_us: u64 = 100_000;
+            let max_us = (quota * period_us as f32).round() as u64;
+            let _ = write_file(&dir.join("cpu.max"), &format!("{max_us} {period_us}"));
+        }
     }
     if let Some(v) = l.io_weight {
         // Base weight applies to any device without a specific rule.
