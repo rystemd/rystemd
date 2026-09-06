@@ -10,6 +10,7 @@
 //! the only type that runs processes; *target*/*timer*/*socket* are marker or
 //! trigger types with no process of their own.
 
+use crate::log::mgr_log;
 use crate::manager::Manager;
 use crate::manager::state::{
     ActiveState, ControlCommand as UnitControlCommand, SubState, UnitResult,
@@ -29,7 +30,17 @@ pub struct ServiceUnit;
 
 impl UnitType for ServiceUnit {
     fn start(&self, mgr: &mut Manager, name: &str) {
-        let u = mgr.units.get_mut(name).unwrap();
+        // `do_start`/`do_stop` only reach us after `units.contains_key(name)`
+        // holds, but `panic = "abort"` makes a single bug a kernel panic as
+        // PID 1 — fail closed instead. The manager logs and marks the unit
+        // failed; the caller (`do_start`) will then call `fail_unit` itself
+        // when the unit is missing.
+        let Some(u) = mgr.units.get_mut(name) else {
+            mgr_log(&format!(
+                "[{name}] start: unit vanished between dispatch and vtable (bug)"
+            ));
+            return;
+        };
         u.main_pid = None;
         u.group_pid = None;
         u.control_pid = None;
@@ -57,7 +68,12 @@ impl UnitType for ServiceUnit {
     fn stop(&self, mgr: &mut Manager, name: &str) {
         let has_main = mgr.unit_has_processes(name);
         let (sig, no_exec_stop) = {
-            let u = mgr.units.get(name).unwrap();
+            let Some(u) = mgr.units.get(name) else {
+                mgr_log(&format!(
+                    "[{name}] stop: unit vanished between dispatch and vtable (bug)"
+                ));
+                return;
+            };
             let sc = u.service_cfg().cloned();
             (
                 sc.as_ref()
@@ -69,12 +85,18 @@ impl UnitType for ServiceUnit {
 
         if has_main {
             mgr.kill_tree(name, sig);
-            mgr.units.get_mut(name).unwrap().sub = SubState::StopSigterm;
+            match mgr.units.get_mut(name) {
+                Some(u) => u.sub = SubState::StopSigterm,
+                None => return,
+            }
             mgr.arm_stop_timeout(name);
         } else if no_exec_stop {
             mgr.finalize_stop(name);
         } else {
-            mgr.units.get_mut(name).unwrap().sub = SubState::Stop;
+            match mgr.units.get_mut(name) {
+                Some(u) => u.sub = SubState::Stop,
+                None => return,
+            }
             mgr.spawn_control(name, UnitControlCommand::Stop, 0);
         }
     }
@@ -86,11 +108,11 @@ pub struct TargetUnit;
 
 impl UnitType for TargetUnit {
     fn start(&self, mgr: &mut Manager, name: &str) {
-        mgr.units.get_mut(name).unwrap().set_active(
-            ActiveState::Active,
-            SubState::Dead,
-            UnitResult::Success,
-        );
+        let Some(u) = mgr.units.get_mut(name) else {
+            mgr_log(&format!("[{name}] target start: unit vanished (bug)"));
+            return;
+        };
+        u.set_active(ActiveState::Active, SubState::Dead, UnitResult::Success);
         mgr.complete_start_job(name);
     }
 
@@ -105,11 +127,11 @@ pub struct TimerUnit;
 
 impl UnitType for TimerUnit {
     fn start(&self, mgr: &mut Manager, name: &str) {
-        mgr.units.get_mut(name).unwrap().set_active(
-            ActiveState::Active,
-            SubState::Dead,
-            UnitResult::Success,
-        );
+        let Some(u) = mgr.units.get_mut(name) else {
+            mgr_log(&format!("[{name}] timer start: unit vanished (bug)"));
+            return;
+        };
+        u.set_active(ActiveState::Active, SubState::Dead, UnitResult::Success);
         mgr.complete_start_job(name);
     }
 
@@ -142,11 +164,11 @@ impl UnitType for PathUnit {
                 }
             }
         }
-        mgr.units.get_mut(name).unwrap().set_active(
-            ActiveState::Active,
-            SubState::Dead,
-            UnitResult::Success,
-        );
+        let Some(u) = mgr.units.get_mut(name) else {
+            mgr_log(&format!("[{name}] path start: unit vanished (bug)"));
+            return;
+        };
+        u.set_active(ActiveState::Active, SubState::Dead, UnitResult::Success);
         mgr.complete_start_job(name);
     }
 
@@ -191,11 +213,11 @@ pub struct DeviceUnit;
 #[cfg(all(target_os = "linux", feature = "udev"))]
 impl UnitType for DeviceUnit {
     fn start(&self, mgr: &mut Manager, name: &str) {
-        mgr.units.get_mut(name).unwrap().set_active(
-            ActiveState::Active,
-            SubState::Dead,
-            UnitResult::Success,
-        );
+        let Some(u) = mgr.units.get_mut(name) else {
+            mgr_log(&format!("[{name}] device start: unit vanished (bug)"));
+            return;
+        };
+        u.set_active(ActiveState::Active, SubState::Dead, UnitResult::Success);
         mgr.complete_start_job(name);
     }
 
