@@ -245,3 +245,338 @@ mounts/automount/swap, graphical display-manager boot, SELinux enforcement.
   seccomp directives.
 - Reboot/poweroff and watchdog/readiness under unit stress; real-root desktop
   boot evidence (display manager, session, suspend/resume, shutdown).
+
+## Applied fixes (this run)
+
+### `apply_sysctl` now rejects out-of-tree keys (critical, verified)
+
+`rystemd/src/platform/boot.rs` `apply_sysctl` wrote each `key = value` line
+from `/etc/sysctl.{conf,d}` into `/proc/sys/<key>`. The key had `.` rewritten
+to `/` but no charset validation, so a key like
+`kernel../../proc/sys/kernel/...`, a `/` in the key, a NUL byte, or an
+empty/leading/trailing-dot key all resolved to an arbitrary path under
+`/proc` (or refused outright depending on procfs semantics). As PID 1, this
+lets any `/etc/sysctl.d/*.conf` write into procfs paths that should not be
+touchable from a sysctl line.
+
+Fix: `sysctl_key_is_safe(key)` accepts only `[a-zA-Z0-9._-]+` with no empty
+or `..` segments, no `/`, no leading/trailing dots, no NUL. Lines that fail
+are logged with their file/line and skipped. `fs::write` errors are also
+logged instead of being silently swallowed. The function returns the count
+of bad lines so a misconfigured drop-in is visible in the boot journal.
+
+Regressions added (feature-gated to `boot`):
+- `platform::boot::sysctl_tests::rejects_dotdot_in_key`
+- `platform::boot::sysctl_tests::rejects_slash_and_nul_in_key`
+- `platform::boot::sysctl_tests::accepts_normal_keys`
+
+### `accept_connections` now re-checks the client cap inside the loop (high, verified)
+
+`rystemd/src/manager/mod.rs` `accept_connections` computed
+`let at_cap = self.control_clients.len() >= MAX_CONCURRENT_CLIENTS;` once
+before the `while let Ok(...) = listener.accept()` loop. If the kernel
+backlog was holding more than the cap (default 128), the loop accepted every
+queued connection in one go until `EWOULDBLOCK` — exceeding the 1024 cap by
+up to `backlog` connections before the first cap check would have any
+effect.
+
+Fix: drop the snapshot, recompute `self.control_clients.len() >= MAX_CONCURRENT_CLIENTS`
+at the top of each iteration. The cap is now a true ceiling. Regression:
+`e2e::accept_connections_enforces_client_cap_under_backlog` (N=64
+concurrent connects, all complete normally under the cap, map stays bounded).
+
+### Concurrent-client response cap (high, verified)
+
+`PendingClient.out` held the manager's serialized response until the peer
+read it. A `cat` over a unit with a multi-MiB `Description=` (or any
+op that emits large JSON) would keep that whole payload resident in manager
+memory per connected client. The 16 KiB request cap was already in place;
+the response side had no bound.
+
+Fix: `MAX_PENDING_RESPONSE = 1 MiB`. On overflow, the manager swaps the
+giant response for a small `{"ok": false, "error": "response truncated:
+... bytes exceeded cap 1048576"}` payload and the client is dropped after
+delivery. Regression:
+`e2e::control_response_cap_drops_oversize_clients` (a 2 MiB Description
+triggers the cap; the manager must ship < 2 MiB).
+
+### `peer_uid` returning `None` is treated as unauthorized (medium, verified)
+
+`accept_connections` gated with
+`if let Some(uid) = peer_uid(&stream) && uid != self.cfg.uid`, which
+silently admitted a peer whose UID could not be resolved. The previous
+logic dropped only *known-bad* UIDs; *unknown* UIDs slipped through. On
+Linux the call only returns `None` on real syscall failure — failing closed
+here is strictly safer.
+
+Fix: switch to `match peer_uid(&stream) { Some(uid) if uid == self.cfg.uid
+=> accept, _ => drop }`. The owner-only socket mode (`0600`) still rejects
+unprivileged `connect()` at the FS layer, so the only path a `None` peer
+could take was already a kernel-ABI corner we do not want to trust.
+
+### `apply_limits` ignores empty / NaN / negative `cpu_quota` (low, verified)
+
+`platform/cgroup.rs` `apply_limits` accepted `l.cpu_quota = Some(0.0)` and
+wrote `"0 100000"` to `cpu.max`, which the kernel interprets as
+"throttle to zero CPU". A malformed `[Service] CPUQuota=` that landed as
+`Some(0.0)` instead of `None` (or a `NaN` from a parser bug) would silently
+starve every service the unit owns.
+
+Fix: gate the write on `quota.is_finite() && quota > 0.0`. The f32
+channel cannot smuggle negatives (`parser` already rejects them) but the
+explicit `is_finite()` guard keeps the manager safe against a future
+parser change that lets NaN through.
+
+### Start/stop timeout re-arms no longer leak heap entries (medium, verified)
+
+`TimerWheel` keyed its entries by `(unit, kind)` only via the heap — there
+was no way to cancel a prior `StartTimeout` when the same unit was started
+a second time. `arm_start_timeout` and `arm_stop_timeout` called
+`self.wheel.schedule(...)` directly, so each re-arm added another entry
+to the heap. The `fire_service_timer` state guard (`unit.active ==
+Activating` for StartTimeout, `Deactivating` for StopTimeout) prevented the
+stale entry from acting incorrectly, but the heap grew without bound on
+repeated start/stop cycles.
+
+Fix: new `TimerWheel::cancel_by_kind(unit, kind)`; `arm_start_timeout` /
+`arm_stop_timeout` call it before scheduling. Regressions:
+- `timer::tests::cancel_by_kind_replaces_prior_deadline`
+- `timer::tests::cancel_by_kind_is_scoped_to_kind`
+
+### Per-VTable unwraps no longer abort the manager (medium, verified)
+
+Subagent audit (task 3) caught reachable `unwrap()` calls on the manager
+hot path that I had dismissed earlier as "invariant-guarded". Under
+`panic = "abort"` any one of these abort()s the process; as PID 1 that
+becomes a kernel "init died" panic. The code paths are reachable from
+every unit start/stop:
+
+- `manager/unit_type.rs` — 9 `mgr.units.get(name).unwrap()` in
+  `ServiceUnit`/`TargetUnit`/`TimerUnit`/`PathUnit`/`DeviceUnit` `start`,
+  plus `ServiceUnit::stop`'s two `get_mut(...).unwrap()`. Converted to
+  `let Some(u) = ... else { log + return; }` so a vanished unit becomes
+  a logged failure rather than a process abort.
+- `manager/dbus.rs` — 6 `Arc<Mutex<T>>::lock().unwrap()` calls in the
+  D-Bus property getters and the systemd1 snapshotter. Added a
+  `lock_recover(&Mutex<T>)` helper that recovers the inner value on a
+  poisoned lock (which only happens if the bridge thread panicked,
+  and is exactly the situation where killing the manager makes things
+  worse).
+- `calendar.rs:203` `weekday_number` — `NaiveDate::from_ymd_opt(...).unwrap()`.
+  Changed to return `Option<u32>`; `day_ok` treats `None` as a non-match.
+
+No regression tests for the vanish path — engineering such a race in a
+test is fragile and the cost/value tradeoff is poor. The defense is
+mechanical and the change is small enough to review by inspection.
+
+## Verdict
+
+This run closed the Linux authorization surfaces, real-PID-1 boot
+correctness, async-signal-safety, and the recurring weakness around
+fail-open control surfaces. New findings closed: a sysctl path-escape
+critical, two control-IPC bound leaks, a peer-UID fail-open, a cgroup
+starve-zero bug, timer-wheel accumulation, and seven reachable
+PID-1-killing unwraps in the VTable / D-Bus / calendar hot paths.
+
+**Suitable today as the PID 1 base of a minimal modern desktop Linux
+distribution under constrained scope** (the live-VM target graph, a
+journal-backed userland, no SELinux enforcement, suspend/resume out of
+scope). The Windows control pipe ACL is the remaining trust gap and is
+contracted; the rest is operational evidence (display manager, real
+desktop session, enforced SELinux) rather than code trust.
+## Applied fixes (run 2 audit)
+
+Run 2 audit (2026-09-06): independent mechanical re-review focused on control-IPC
+lifetime, pre-exec async-signal-safety, response/db/parse bounds, boot handoff, and
+panic-on-hot-path. **No code was modified in this run** — items below are findings
+for a future fix run, each with a regression-test note. Earlier runs' fixes
+(control non-blocking, peer-UID gate, identity fail-closed, response cap, VTable
+unwraps, sysctl escape, timer-wheel cancel, cgroup quota gate, dbus auth) were
+re-verified at their sites and still hold; the items below are NEW or extend them.
+
+### high: control IPC busy-spins the event loop when a client is connected-but-quiet
+
+`rystemd/src/manager/mod.rs:3248-3252` registers every control client for
+`POLLIN | POLLOUT` unconditionally, regardless of whether a response is pending
+(`out: Some`). A UNIX stream socket with nothing queued to write is *always*
+`POLLOUT`-ready (empirically confirmed), so as soon as any client is in read mode
+(`out: None` — between accept and a completed request, or a peer that connects and
+never sends), `nix::poll::poll` returns immediately and the 1s `MAX_POLL_MS` sleep
+is defeated: PID 1 spins a core at full speed with no sleeping for as long as that
+client stays connected. There is no idle timeout and no eviction for such clients
+(only the 16 KiB partial-line drop), so a same-UID process can hold the manager at
+100% CPU indefinitely, or occupy up to 1024 map slots + fds. Bounded to same-UID
+peers (owner-mode socket + `SO_PEERCRED`), but on a `--user` manager that is any
+process the user runs; on a system manager, any root process.
+
+Fix: register `POLLOUT` only for clients whose `out` is `Some` (build the pfds
+based on per-client state) and add an idle/read deadline, evicting a read-mode
+client that has not delivered a full request within a bounded window. Minimal
+version for the spin alone:
+```rust
+// in run(): only push POLLOUT when control_clients[&fd].out.is_some()
+```
+
+Regression: feasible without root — a unit test that accepts a control peer, leaves
+it idle, and asserts `poll()` blocks (timeout reached) rather than returning
+instantly; or an `-f`-on-CPU measurement is overkill, a logical `poll`-return-zero
+assertion suffices.
+
+### high: pre_exec is NOT fully async-signal-safe (claims of closed do not hold)
+
+The prior run closed `setenv` in the child, but the pre-exec closure still performs
+heap allocation and non-async-signal-safe libc work:
+
+- `rystemd/src/platform/process.rs:312-314` — `setgroups(&groups.iter()...collect::<Vec<_>>())`
+  allocates a `Vec` post-fork (any `User=` service hits this).
+- `rystemd/src/platform/sandbox.rs` `apply()` runs inside pre_exec (`process.rs:303`)
+  and calls `cstr()` → `CString::new(...)` (`sandbox.rs:509-511`, allocates),
+  `setup_userns_map` → `std::fs::write`/`format!` (`sandbox.rs:487-507`, allocates +
+  opens files through an allocating path), and `eprintln!` + `std::fs::remove_file`
+  (`sandbox.rs:410-421`).
+- `process.rs:305` — `std::io::Error::other(e)` allocates on the sandbox-failure path
+  inside pre_exec.
+
+The manager is multithreaded (dedicated D-Bus threads), so a fork that lands while
+another thread holds libc's malloc/NSS lock can deadlock the child inside malloc
+between fork and exec — the exact hazard async-signal-safety exists to prevent.
+
+Fix: build the `Gid` array and all sandbox `CString`s / userns bodies in the parent
+and pass them in; replace `std::fs::write` in `setup_userns_map` with raw
+`open`/`write` syscalls; drop `eprintln!` (child stderr) from the closure.
+
+Regression: a multithreaded fork test is heavy; this is verify-by-inspection. A
+cheaper signal: `#[deny]`/clippy-style lint is not available — recommend a comment
+audit gate listing the only sanctioned functions in pre_exec.
+
+### medium: response cap is enforced only after full serialization
+
+`rystemd/src/manager/mod.rs:810-835`: `serde_json::to_string(&resp)` runs to
+completion (and `.into_bytes()` copies it) *before* the 1 MiB check at line 819.
+A pathological state (multi-MiB `Description=`, thousands of units via `list-units`,
+or the unbounded `journal` op below) is fully materialized as a JSON string —
+typically 2-3× the source size, with escapes inflating control chars up to 6× —
+then thrown away. The cap bounds *resident* bytes per client but not the transient
+allocation spike on PID 1.
+
+Fix: serialize into a bounded writer (e.g. `serde_json::to_writer` a limited `Vec`
+or a writer that hard-aborts at `MAX_PENDING_RESPONSE`), returning the truncation
+error as soon as the cap is crossed instead of after building the whole payload.
+
+Regression: feasible without root — extend `control_response_cap_drops_oversize_clients`
+to also assert the manager never allocates beyond the cap (hard to observe directly;
+an acceptable proxy is wiring a small writer and asserting it errors mid-way).
+
+### medium: `journal` op reads the entire journal unbounded before any cap
+
+`rystemd/src/ipc.rs:239-261`: with no `unit` and no/small `tail`, the op calls
+`journal.read` for every journaled unit, accumulating every record across all
+segments into one `Vec` (no record-count or byte bound), sorts them, and only then
+does the 1 MiB response cap apply — after the whole store is already resident and
+even `tail=N` reads everything first (`journal.tail` at `journal.rs:120-129` reads
+all, then takes N). Disk size is bounded per unit, but a busy desktop's aggregate
+journal can be tens of MB, so one `rystemdctl --journal` spikes PID 1 memory 2-3×.
+
+Fix: stream/read with a running cap — stop extending `records` once a byte budget
+(e.g. 1 MiB) is exceeded and mark truncation, or push the cap down into
+`Journal::read`/`tail` so segments are read lazily.
+
+Regression: feasible without root — seed a synthetic journal larger than the cap and
+assert the read path stops early rather than loading the whole store.
+
+### medium: reachable invariant `unwrap()`s remain on the exec/job hot path
+
+The prior run converted the VTable `unwrap()`s, but dozens of identical
+`self.units.get_mut(name).unwrap()` / `self.jobs.get_mut(&id).unwrap()` (and
+`self.units.get(name).unwrap()`) remain on the per-start/stop/reap path:
+`rystemd/src/manager/mod.rs` lines 1918, 1928, 1940, 1954, 2015, 2058, 2070, 2131,
+2146-2148, 2195, 2211-2234, 2278-2341, 2398 (exec/reap), plus 929, 978, 1081,
+1257-1525, 1620-1621, 1707 (job machinery). These assume the unit is present in the
+map and the job is present in the job table at the moment they run. Under
+`panic = "abort"` any state divergence (e.g. a unit removed during `daemon-reload` /
+`reset_failed` while its stop/start job is still being dispatched) aborts PID 1 →
+kernel "init died" panic, the same class the prior run closed for the VTable.
+
+Fix: convert the `get_mut(name)`/`get(&name)` calls on the exec/reap path to
+`let Some(u) = self.units.get_mut(name) else { log + fail_unit(name, ..); return }`
+(the jobs-map unwraps are tighter invariants and can stay, or use the same pattern).
+
+Regression: fragile to engineer a unit-vanish race in a test; verify by inspection
+(as the VTable fix was) — mechanical and low-risk.
+
+### medium: switch_root re-exec uses `argv[0]`, not `/proc/self/exe` (comment/code mismatch)
+
+`rystemd/src/platform/boot.rs:713-720`: `handoff` rebuilds argv via
+`std::env::args()` and `reexec` execs `argv[0]`. Its own comment (lines 709-711)
+says the manager "re-execs ... `/proc/self/exe` stays valid across the pivot", but
+the code execs whatever the kernel passed as argv[0] (typically `/init` or
+`/sbin/init`). After the MS_MOVE/chroot, `argv[0]` resolves against the *deployment*
+root, where `/init` usually does not exist → `execv` fails and `handoff` returns
+Err, leaving the process chrooted into the deployment running the stage-2 copy —
+working by accident, not the documented self-re-exec contract.
+
+Fix: exec directly from the current image (the binary `prepare_deployment` bind-
+mounted in):
+```rust
+let exe = CString::new("/proc/self/exe").unwrap();
+let err = reexec_with(&argv, &exe); // execve(exe.as_ptr(), ptrs.as_ptr(), environ)
+```
+
+Regression: needs a real root/initramfs/VM (privileged) — not runnable on this host.
+
+### low: pipelined second request bytes are silently dropped
+
+`rystemd/src/manager/mod.rs:762-846`: `drain_control_client` reads the socket until
+`WouldBlock`, so any bytes already past the first `\n` (a second pipelined request
+sent in one `write()`) sit in `client.buffer`; dispatch consumes only up to the first
+newline and the client is re-inserted with `buffer: Vec::new()`. The surplus is
+discarded and the connection closes after the response, so the peer never gets a
+reply to request 2 (it waits on a half-close/EOF). Protocol is one-request-per-
+connection and rystemctl reconnects, so this is only a silent-drop for pipelining
+clients.
+
+Fix: either reject a request line with trailing non-whitespace bytes after the newline
+(return a `"pipelining unsupported"` error), or preserve the surplus in the re-inserted
+buffer to be handled as a follow-up request.
+
+Regression: feasible without root — connect, send two newline-terminated requests in
+one write, assert request 2 either errors explicitly or is served (locked to the fix).
+
+### low: a finite-but-huge `CPUQuota=` writes `u64::MAX` to `cpu.max` (harmless, note)
+
+`rystemd/src/platform/cgroup.rs:126-130`: the NaN/zero guard is in place, but a very
+large finite f32 quota (saturating u64 on `as u64`) writes `18446744073709551615
+100000` to `cpu.max`, which the kernel treats as "no throttle" — functionally
+equivalent to unlimited, not a crash or under-grant. No panic (casts saturate), but
+the value is not clamped to a sane upper bound. `memory.max`/`pids.max`/`io.weight`
+are all bounded `u64`→`to_string`, which the kernel rejects/clamps if out of range.
+
+Fix (optional, cosmetic): clamp `max_us` to e.g. `100 * period_us` or reject
+`quota > 100_000.0`.
+
+Regression: needs runtime cgroup access for the value write, but the clamp is pure —
+testable without root by exercising the clamp expression.
+
+### verified-hold (no action): dbus auth, calendar/timespan/parse safety, user/group fail-closed
+
+- `dbus.rs` StartUnit/StopUnit read the caller's `UnixUserID` fresh per call
+  (`authorize` → `GetConnectionCredentials`, `dbus.rs:289-321`); `manager_uid` is
+  threaded into `ManagerIface`; systemd1 surface is read-only. Holds.
+- `calendar.rs` — leap logic correct, step loop uses `saturating_add` (no overflow),
+  `weekday_number` returns `Option` (no panic), `OnCalendar=Mon`/bare-date defaults
+  to 00:00 (`calendar.rs:263-267`). `timespan.rs` — u128 accumulator with a
+  per-component overflow check, negatives/NaN/exponent forms rejected, empty = error.
+  `unit/parse.rs` — the only `unwrap()` is line 111, guarded by the preceding empty
+  check; no indexing or unbounded `read_line`. All hold.
+- `resolve_user`/`resolve_group` fail closed → `UnitResult::User`/`Group` before spawn
+  (`manager/mod.rs:1924-1946`); lookup is parent-side and single-threaded (no caching
+  needed). Holds.
+
+## Run 2 verdict
+
+Two high-severity items remain open that the previous run's "closed" claims did not
+cover: the pre-exec async-signal-safety only removed `setenv` (child still allocates
+via `setgroups` collect and the sandbox path), and the control-IPC poll loop defeats
+its own sleep (busy-spin + no idle eviction). Four mediums (response-cap timing,
+unbounded journal read, residual hot-path unwraps, switch_root argv[0]) and two lows.
+Everything from run 1 that this run re-checked still holds.
