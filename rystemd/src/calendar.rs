@@ -198,10 +198,14 @@ fn days_in_month(y: i32, m: u32) -> u32 {
     }
 }
 
-/// 1 = Monday .. 7 = Sunday.
-fn weekday_number(y: i32, m: u32, d: u32) -> u32 {
-    let date = NaiveDate::from_ymd_opt(y, m, d).unwrap();
-    date.weekday().num_days_from_monday() + 1
+/// 1 = Monday .. 7 = Sunday. Returns `None` for invalid (y, m, d) rather
+/// than panicking — `panic = "abort"` would make a bad date a kernel panic
+/// as PID 1. Callers should treat `None` as "no match" (the day is invalid
+/// for that month/year, which can only happen if the caller's bounds check
+/// is wrong).
+fn weekday_number(y: i32, m: u32, d: u32) -> Option<u32> {
+    let date = NaiveDate::from_ymd_opt(y, m, d)?;
+    Some(date.weekday().num_days_from_monday() + 1)
 }
 
 impl CalendarSpec {
@@ -265,7 +269,9 @@ impl CalendarSpec {
     }
 
     fn day_ok(&self, y: i32, m: u32, d: u32) -> bool {
-        let dow = weekday_number(y, m, d);
+        let Some(dow) = weekday_number(y, m, d) else {
+            return false;
+        };
         match (&self.day, &self.dow) {
             (Field::Any, Field::Any) => true,
             (Field::Any, dowf) => dowf.matches(dow),
