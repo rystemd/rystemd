@@ -558,36 +558,46 @@ struct UnitIface {
     state: Arc<Mutex<UnitEntry>>,
 }
 
+/// Like `Mutex::lock`, but recovers the inner value when the lock is
+/// poisoned. Used on every D-Bus property getter so a panic elsewhere in the
+/// bridge does not abort the manager under `panic = "abort"`.
+fn lock_recover<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    match m.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
 #[interface(name = "org.freedesktop.systemd1.Unit")]
 impl UnitIface {
     /// The name of this unit (e.g. `foo.service`).
     #[zbus(property)]
     fn id(&self) -> String {
-        self.state.lock().unwrap().name.clone()
+        lock_recover(&self.state).name.clone()
     }
 
     /// The human-readable description of this unit.
     #[zbus(property)]
     fn description(&self) -> String {
-        self.state.lock().unwrap().description.clone()
+        lock_recover(&self.state).description.clone()
     }
 
     /// The load state (e.g. `loaded`).
     #[zbus(property)]
     fn load_state(&self) -> String {
-        self.state.lock().unwrap().load.clone()
+        lock_recover(&self.state).load.clone()
     }
 
     /// The active state (e.g. `active`).
     #[zbus(property)]
     fn active_state(&self) -> String {
-        self.state.lock().unwrap().active.clone()
+        lock_recover(&self.state).active.clone()
     }
 
     /// The sub state (e.g. `running`).
     #[zbus(property)]
     fn sub_state(&self) -> String {
-        self.state.lock().unwrap().sub.clone()
+        lock_recover(&self.state).sub.clone()
     }
 
     /// The unit this unit follows, if any. Empty for now.
@@ -764,7 +774,7 @@ fn apply_unit_snapshot(
         let path = unit_dbus_path(&name);
         if let Some(shared) = units.get(&name) {
             // Changed and/or unchanged: refresh the shared property state.
-            *shared.lock().unwrap() = entry;
+            *lock_recover(shared) = entry;
         } else {
             let shared = Arc::new(Mutex::new(entry));
             if let Err(e) = conn.object_server().at(
