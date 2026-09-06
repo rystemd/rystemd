@@ -206,8 +206,31 @@ fn ensure_machine_id() -> Result<(), String> {
     fs::write("/etc/machine-id", hex.as_bytes()).map_err(|e| e.to_string())
 }
 
+/// True when `key` is a safe sysctl identifier: ASCII alphanumerics plus
+/// `.`/`_`/`-`, no empty segments, no leading/trailing dots, no NUL. Matches
+/// the kernel's accepted charset for `/proc/sys/*` keys (see sysctl(2) and
+/// systemd's `sysctl_is_safe`). A key containing `/`, `..`, NUL, or anything
+/// non-ASCII would resolve to an arbitrary path under `/proc` (or refuse the
+/// write outright) — reject it instead of letting the procfs layer interpret
+/// it.
+fn sysctl_key_is_safe(key: &str) -> bool {
+    !key.is_empty()
+        && !key.contains('\0')
+        && !key.contains('/')
+        && !key.contains("..")
+        && !key.starts_with('.')
+        && !key.ends_with('.')
+        && key
+            .as_bytes()
+            .iter()
+            .all(|&b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-')
+}
+
 /// Apply `/etc/sysctl.conf` and `/etc/sysctl.d/*.conf` (`key = value` lines)
-/// by writing to `/proc/sys/...`. `-key` lines (never set) are skipped.
+/// by writing to `/proc/sys/...`. `-key` lines (never set) are skipped. A
+/// line whose key fails `sysctl_key_is_safe` is logged and skipped — the
+/// previous behavior accepted arbitrary keys and wrote to whatever procfs
+/// path they resolved to, which an `/etc/sysctl.d/*.conf` could abuse.
 fn apply_sysctl() -> Result<(), String> {
     let mut files = vec!["/etc/sysctl.conf".to_string()];
     if let Ok(rd) = fs::read_dir("/etc/sysctl.d") {
@@ -219,13 +242,14 @@ fn apply_sysctl() -> Result<(), String> {
         v.sort();
         files.extend(v);
     }
+    let mut bad_lines = 0usize;
     for f in files {
         let text = match fs::read_to_string(&f) {
             Ok(t) => t,
             Err(_) => continue,
         };
-        for line in text.lines() {
-            let line = line.trim();
+        for (lineno, raw_line) in text.lines().enumerate() {
+            let line = raw_line.trim();
             if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
                 continue;
             }
@@ -233,11 +257,62 @@ fn apply_sysctl() -> Result<(), String> {
             let Some((key, val)) = rest.split_once('=') else {
                 continue;
             };
-            let path = format!("/proc/sys/{}", key.trim().replace('.', "/"));
-            let _ = fs::write(&path, val.trim());
+            let key = key.trim();
+            if !sysctl_key_is_safe(key) {
+                eprintln!(
+                    "rystemd boot[sysctl]: {}:{}: refused unsafe sysctl key `{key}`",
+                    f,
+                    lineno + 1
+                );
+                bad_lines += 1;
+                continue;
+            }
+            let path = format!("/proc/sys/{}", key.replace('.', "/"));
+            if let Err(e) = fs::write(&path, val.trim()) {
+                eprintln!(
+                    "rystemd boot[sysctl]: {}:{}: write {path} failed: {e}",
+                    f,
+                    lineno + 1
+                );
+                bad_lines += 1;
+            }
         }
     }
-    Ok(())
+    if bad_lines == 0 {
+        Ok(())
+    } else {
+        // Surface the count rather than swallowing it: a misconfigured sysctl
+        // drop-in is a boot-time regression worth seeing in the journal.
+        Err(format!("{bad_lines} sysctl line(s) skipped or failed"))
+    }
+}
+
+#[cfg(test)]
+mod sysctl_tests {
+    use super::sysctl_key_is_safe;
+
+    #[test]
+    fn rejects_dotdot_in_key() {
+        assert!(!sysctl_key_is_safe("kernel../../proc/sys/kernel/hostname"));
+        assert!(!sysctl_key_is_safe("net..ipv4.ip_forward"));
+    }
+
+    #[test]
+    fn rejects_slash_and_nul_in_key() {
+        assert!(!sysctl_key_is_safe("kernel/foo"));
+        assert!(!sysctl_key_is_safe("kernel\\0foo"));
+        assert!(!sysctl_key_is_safe(""));
+        assert!(!sysctl_key_is_safe(".leading"));
+        assert!(!sysctl_key_is_safe("trailing."));
+    }
+
+    #[test]
+    fn accepts_normal_keys() {
+        assert!(sysctl_key_is_safe("net.ipv4.ip_forward"));
+        assert!(sysctl_key_is_safe("kernel.shmmax"));
+        assert!(sysctl_key_is_safe("vm.swappiness"));
+        assert!(sysctl_key_is_safe("fs.file-max"));
+    }
 }
 
 /// Load kernel modules listed in `/etc/modules-load.d/*.conf` via `modprobe`.
