@@ -61,6 +61,17 @@ impl TimerWheel {
         self.entries.retain(|_, e| e.unit != unit);
     }
 
+    /// Cancel scheduled entries for `unit` matching a specific `kind`. Used
+    /// when a single (unit, kind) pair must have at most one live deadline —
+    /// e.g. StartTimeout/StopTimeout, where the fire path is guarded by the
+    /// unit's `ActiveState` so a stale entry is harmless functionally but
+    /// leaks heap slots every re-arm cycle.
+    pub fn cancel_by_kind(&mut self, unit: &str, kind: TimerKind) {
+        let unit = unit.to_string();
+        self.entries
+            .retain(|_, e| !(e.unit == unit && e.kind == kind));
+    }
+
     /// Earliest deadline still scheduled, pruning stale entries.
     pub fn next_deadline(&mut self) -> Option<Instant> {
         while let Some(&Reverse((_, id))) = self.heap.peek() {
@@ -142,5 +153,42 @@ mod tests {
         w.cancel(id);
         assert_eq!(w.pop_due(base + Duration::from_millis(1)).len(), 1);
         assert_eq!(w.pop_due(base + Duration::from_millis(2)).len(), 0);
+    }
+
+    /// Re-arming the same `(unit, kind)` pair must not accumulate entries;
+    /// the second schedule must replace (in effect) the first, not stack on
+    /// top of it. Regression for the open finding (REVIEW.md, this run)
+    /// where `arm_start_timeout` / `arm_stop_timeout` would re-schedule
+    /// without cancelling the prior deadline.
+    #[test]
+    fn cancel_by_kind_replaces_prior_deadline() {
+        let mut w = TimerWheel::default();
+        let base = now();
+        w.schedule(base, TimerKind::StartTimeout, "u");
+        w.cancel_by_kind("u", TimerKind::StartTimeout);
+        w.schedule(
+            base + Duration::from_millis(5),
+            TimerKind::StartTimeout,
+            "u",
+        );
+        // Only the post-cancel entry should fire; the first was dropped.
+        let due = w.pop_due(base + Duration::from_millis(10));
+        assert_eq!(due.len(), 1, "exactly one StartTimeout must remain");
+        assert_eq!(due[0].unit, "u");
+    }
+
+    /// Different `kind` entries for the same unit must NOT be cancelled by
+    /// `cancel_by_kind` for a different `kind` — it is a (unit, kind) pair
+    /// cancel, not a unit-only cancel.
+    #[test]
+    fn cancel_by_kind_is_scoped_to_kind() {
+        let mut w = TimerWheel::default();
+        let base = now();
+        w.schedule(base, TimerKind::StartTimeout, "u");
+        w.schedule(base, TimerKind::StopTimeout, "u");
+        w.cancel_by_kind("u", TimerKind::StartTimeout);
+        let due = w.pop_due(base + Duration::from_millis(1));
+        assert_eq!(due.len(), 1);
+        assert!(matches!(due[0].kind, TimerKind::StopTimeout));
     }
 }
