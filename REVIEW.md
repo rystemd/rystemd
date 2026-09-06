@@ -171,25 +171,10 @@ Check every future control surface against this pattern before adding it.
 
 ## Open findings (blockers unless closed)
 
-### Medium: start/stop timeout entries keyed only by unit
-
-A stale deadline for one activation can affect a later one. Key deadlines by
-job/activation generation. Still open.
-
-### Medium: Windows control pipe has no explicit security descriptor (blocked)
-
-`rystemd/src/platform/windows/net.rs` uses `lpSecurityAttributes = NULL`, so
-the pipe inherits the default DACL and dispatches mutating operations without
-caller checks or impersonation.
-
-Blocked on a Windows runtime/CI runner. This host cannot execute Windows
-code, and a correct fix cannot be safely shipped untested: the policy is
-SYSTEM + Administrators for the system pipe, the owning user for the user
-pipe (a naive same-SID-as-server check would break the elevated admin CLI).
-Contract once a runner exists: explicit per-mode DACL (or per-caller
-`CheckTokenMembership` against the owning user / BUILTIN\\Administrators),
-mutating ops authorized per caller, and Windows tests that connect as allowed
-and denied SIDs and assert every mutating op. Not half-built here by design.
+Open findings are tracked as GitHub issues labelled `v0.3.0`. See
+<https://github.com/rystemd/rystemd/issues?q=is%3Aissue+is%3Aopen+label%3Av0.3.0>
+for the current list. Each issue carries severity, acceptance criteria,
+and the verification gate.
 
 ### Note: bare dependency names are not a defect
 
@@ -214,37 +199,29 @@ packaging, GNU plus musl release lanes.
 
 Untested or partial for a desktop: logind/session, user managers at scale,
 desktop D-Bus activation, suspend/resume/hibernate, power buttons, udev-driven
-device lifecycle beyond the monitor, emergency/recovery targets, fsck/crypt/
-mounts/automount/swap, graphical display-manager boot, SELinux enforcement.
+device lifecycle beyond the monitor, fsck/crypt/mounts/automount/swap,
+graphical display-manager boot, SELinux enforcement. Each has a corresponding
+GitHub issue labelled `v0.3.0`; see the issue list above.
 
 ## Required gates for distribution use
 
-1. Native control and D-Bus authorization with unprivileged-denial. Closed:
-   socket owner-only `0600`, peer-UID gate, and D-Bus `StartUnit`/`StopUnit`
-   bus-identity check.
-2. Boot failure policy: real PID 1 aborts without `/proc`/`/dev`. Open: a full
-   interactive emergency/recovery target.
-3. Signal-setup and pre-exec async-signal-safety. Closed in code; a
-   multithreaded fork stress test is still worth adding.
-4. Reboot/poweroff reliability and watchdog/readiness under unit stress.
-5. Recovering from a hung or non-reading control client stays non-blocking;
-   concurrent-control-client cap exercised.
-6. Windows control pipe explicit ACL and per-caller authorization. Blocked on
-   a Windows runner; contract specified.
-7. Fuzz or property coverage for unit parsing, timespans/calendars, JSON/IPC,
-   and seccomp directives.
-8. Real-root desktop boot evidence (display manager, session, suspend/resume,
-   shutdown) in an enforcing SELinux environment.
+Tracked as GitHub issues labelled `v0.3.0`. As of this writing the gates are:
+native control + D-Bus authorization (closed), PID 1 abort without /proc//dev
+(closed at the check; full emergency/recovery target open),
+pre_exec async-signal-safety (setgroups closed in commit 7ce79c7; sandbox path
+open), power-state reliability under load, idle control-client cap exercised,
+Windows control-pipe ACL (blocked on a Windows runner), fuzz coverage for unit
+parsing/timespans/calendars/JSON/IPC/seccomp, real-root desktop boot evidence
+in enforcing SELinux. See the issue list for status and acceptance criteria.
 
 ## Next
 
-- Add a multithreaded fork stress test for the socket-activation env path.
-- Implement and verify the Windows control-pipe ACL once a Windows runner
-  exists (contract above).
-- Fuzz/property coverage for unit parsing, timespans/calendars, JSON/IPC, and
-  seccomp directives.
-- Reboot/poweroff and watchdog/readiness under unit stress; real-root desktop
-  boot evidence (display manager, session, suspend/resume, shutdown).
+Open work is tracked as GitHub issues labelled `v0.3.0`. See the issue list
+above; the current blockers are #1 (pre_exec sandbox::apply), #2 (response
+cap timing), #3 (journal read bounds), #4 (hot-path unwraps), #5 (switch_root
+argv[0]), #6 (Windows control-pipe ACL — blocked), #7 (fuzz coverage), #8
+(stress/lifecycle), #9 (emergency/recovery target), #10 (multithreaded fork
+stress), #11 (SELinux enforcing desktop), #12 (pipelining), #13 (CPUQuota clamp).
 
 ## Applied fixes (this run)
 
@@ -572,11 +549,13 @@ testable without root by exercising the clamp expression.
   (`manager/mod.rs:1924-1946`); lookup is parent-side and single-threaded (no caching
   needed). Holds.
 
-## Run 2 verdict
+## Run 2 outcome
 
-Two high-severity items remain open that the previous run's "closed" claims did not
-cover: the pre-exec async-signal-safety only removed `setenv` (child still allocates
-via `setgroups` collect and the sandbox path), and the control-IPC poll loop defeats
-its own sleep (busy-spin + no idle eviction). Four mediums (response-cap timing,
-unbounded journal read, residual hot-path unwraps, switch_root argv[0]) and two lows.
-Everything from run 1 that this run re-checked still holds.
+The run-2 audit produced the high-severity busy-spin finding (closed in
+commit `7ce79c7`) and the pre-exec `setgroups` Vec pre-collect fix (same
+commit), plus a partial async-signal-safety closure for the sandbox path
+(open, tracked as issue #1). The remaining run-2 open items (response-cap
+timing, journal read bounds, hot-path unwraps, switch_root argv[0], the
+two lows) are tracked as GitHub issues labelled `v0.3.0`. The Windows
+control-pipe ACL remains the unverified trust gap (issue #6, blocked on
+a Windows runner).

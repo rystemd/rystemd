@@ -1,7 +1,13 @@
 # Known issues
 
-This file records current compatibility boundaries. Release history belongs in
-git and changelog files.
+This file records current compatibility boundaries: which systemd features are
+not implemented, which platform or distribution lanes are out of scope, and
+which surface areas are intentionally limited. Release history belongs in
+git and changelog files. Open engineering issues — bugs, trust gaps,
+required fixes — are tracked as GitHub issues labelled `v0.3.0`:
+<https://github.com/rystemd/rystemd/issues?q=is%3Aissue+is%3Aopen+label%3Av0.3.0>.
+This file and the issue list cover different surfaces and are intentionally
+not merged.
 
 ## Distribution and boot
 
