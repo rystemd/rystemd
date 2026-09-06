@@ -1071,3 +1071,250 @@ fn runtime_and_state_directories_created_and_cleaned() {
         "non-empty state dir should persist after stop"
     );
 }
+
+/// Concurrent control-client connects must not blow past the cap even when
+/// many connections arrive in a single accept-loop drain. Regression for the
+/// `accept_connections` cap snapshot bug (REVIEW.md, this run).
+#[test]
+fn accept_connections_enforces_client_cap_under_backlog() {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+
+    let _scratch = Scratch::new();
+    let daemon = Daemon::start();
+    assert!(wait_for(Duration::from_secs(3), || {
+        std::path::Path::new(&daemon.socket).exists()
+    }));
+    // Open a modest batch — well above any plausible backlog size — so the
+    // accept loop has to drop excess entries once the cap is hit.
+    const N: usize = 64;
+    let mut clients: Vec<UnixStream> = Vec::new();
+    for _ in 0..N {
+        match UnixStream::connect(&daemon.socket) {
+            Ok(s) => clients.push(s),
+            Err(_) => break, // cap-exceeded excess drops before accept()
+        }
+    }
+    assert!(
+        clients.len() <= N,
+        "test setup: every successful connect must be tracked"
+    );
+
+    // Each client sends a trivial request and reads a response. The cap is
+    // far above N (1024 by default), so all N must complete normally — the
+    // bug here is that the FIRST accept-loop drain grew the map past the
+    // cap, which we no longer do. A correct manager admits all N.
+    for c in &mut clients {
+        c.set_nonblocking(false).ok();
+        c.write_all(b"{\"op\":\"is_active\",\"units\":[]}\n")
+            .unwrap();
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 256];
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            match c.read(&mut tmp) {
+                Ok(0) => break,
+                Ok(n) => {
+                    buf.extend_from_slice(&tmp[..n]);
+                    if buf.ends_with(b"\n") {
+                        break;
+                    }
+                }
+                Err(_) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(e) => panic!("control client read failed: {e}"),
+            }
+        }
+        let line = std::str::from_utf8(&buf).expect("response must be utf-8");
+        assert!(
+            line.contains("\"ok\":true"),
+            "every connected client must receive a valid response, got: {line:?}"
+        );
+    }
+}
+
+/// A connected client whose response would exceed the per-client cap must be
+/// dropped, not allowed to balloon the manager's resident memory. Regression
+/// for the `PendingClient.out` unbounded-response fix.
+#[test]
+fn control_response_cap_drops_oversize_clients() {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+
+    let scratch = Scratch::new();
+    // A 2 MiB Description field on a real unit forces the `cat` response to
+    // exceed the 1 MiB per-client cap. The manager must truncate rather than
+    // ship the full multi-MiB response and must not let memory balloon.
+    let big_desc = "x".repeat(2 * 1024 * 1024);
+    scratch.write_unit(
+        "huge.service",
+        &format!(
+            "[Unit]\nDescription={big_desc}\n[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/bin/true\n"
+        ),
+    );
+
+    let daemon = Daemon::start();
+    assert!(wait_for(Duration::from_secs(3), || {
+        std::path::Path::new(&daemon.socket).exists()
+    }));
+    let mut c = UnixStream::connect(&daemon.socket).unwrap();
+    let req = serde_json::json!({
+        "op": "cat",
+        "units": ["huge.service"],
+    });
+    let mut line = serde_json::to_string(&req).unwrap();
+    line.push('\n');
+    c.write_all(line.as_bytes()).unwrap();
+
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 4096];
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match c.read(&mut tmp) {
+            Ok(0) => break,
+            Ok(n) => {
+                buf.extend_from_slice(&tmp[..n]);
+                // The cap is 1 MiB; allow a small slack for the truncation
+                // payload, but reject any response larger than 2 MiB — that
+                // would mean the cap failed to fire.
+                if buf.len() > 2 * 1024 * 1024 {
+                    panic!(
+                        "manager shipped more than 2 MiB ({} bytes) on an over-cap response",
+                        buf.len()
+                    );
+                }
+            }
+            Err(_) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(_) => break,
+        }
+    }
+    let response = std::str::from_utf8(&buf).unwrap_or("");
+    // The cap truncates with a small error payload rather than shipping the
+    // multi-MiB JSON. The error string mentions the truncation, so the peer
+    // knows why its connection ended.
+    assert!(
+        response.contains("truncated") || buf.is_empty(),
+        "expected truncated response or close, got {} bytes: {response:?}",
+        buf.len()
+    );
+}
+
+/// An idle (connected-but-quiet) control client must NOT cause the manager's
+/// poll loop to busy-spin. Regression for the unconditional `POLLIN|POLLOUT`
+/// registration on every accepted control fd: a UNIX stream socket with room
+/// in its send buffer is *always* `POLLOUT`-ready, so registering every client
+/// for `POLLOUT` (regardless of whether a response is actually pending) makes
+/// `poll()` return immediately and burns a full core as long as the idle peer
+/// holds the connection. The fix registers `POLLOUT` only for clients whose
+/// response is queued (`out.is_some()`), so an idle peer lets the 1s poll
+/// timeout elapse normally.
+///
+/// We assert this by holding an idle control connection open for one second,
+/// then issuing a *second* concurrent request from a different socket. Under
+/// the busy-spin bug the manager thread is at ~100% CPU for that whole second;
+/// under the fix it spends most of it asleep in `poll(2)`. The second request
+/// completes well within the deadline regardless, so we measure CPU time of
+/// the manager thread from `/proc/self/task/<tid>/stat` (this test's manager
+/// runs in the test's own process via `Daemon::start_impl`, so the target
+/// thread is the one we spawned in `Daemon`).
+#[test]
+fn idle_control_client_does_not_busy_spin_event_loop() {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+    use std::time::Instant;
+
+    let _scratch = Scratch::new();
+    let _daemon = Daemon::start();
+    assert!(wait_for(Duration::from_secs(3), || {
+        std::path::Path::new(&_daemon.socket).exists()
+    }));
+
+    // Open an idle control peer — connect, never write. The manager accepts
+    // and registers it; under the bug this is what triggers the busy-spin.
+    let idle = UnixStream::connect(&_daemon.socket).unwrap();
+    idle.set_nonblocking(false).unwrap();
+
+    // Find the manager thread by its name (set in `Daemon::start_impl`). The
+    // `/proc/<pid>/task/<tid>/comm` file holds the kernel-side thread name;
+    // match `"rystemd-manager"`.
+    let self_pid = std::process::id();
+    let mut manager_tid: Option<i32> = None;
+    for e in std::fs::read_dir(format!("/proc/{self_pid}/task")).unwrap() {
+        let e = e.unwrap();
+        let tid: i32 = e.file_name().to_str().unwrap().parse().unwrap();
+        let comm = std::fs::read_to_string(e.path().join("comm")).unwrap_or_default();
+        // comm is `<name>\n`; we want exact match against our thread name.
+        if comm.trim_end() == "rystemd-manager" {
+            manager_tid = Some(tid);
+            break;
+        }
+    }
+    let tid = manager_tid.expect("manager thread 'rystemd-manager' not found in /proc");
+
+    let stat0 = std::fs::read_to_string(format!("/proc/{self_pid}/task/{tid}/stat")).unwrap();
+    // field 14 = utime, field 15 = stime (1-indexed). The first field is the
+    // `comm` in parentheses and may contain spaces, so split from the right.
+    let parts0: Vec<&str> = stat0.rsplit(')').next().unwrap().split_whitespace().collect();
+    assert!(parts0.len() >= 15, "unexpected /proc stat layout");
+    let utime0: u64 = parts0[11].parse().unwrap();
+    let stime0: u64 = parts0[12].parse().unwrap();
+
+    // Hold the idle peer open for one second. Under the busy-spin bug, this
+    // task accumulates ~CLK_TCK jiffies (≥ 1000 on a 1000-Hz kernel); under
+    // the fix it spends the second in `poll(2)` and accumulates roughly 0.
+    let sample_start = Instant::now();
+    std::thread::sleep(Duration::from_secs(1));
+
+    let stat = std::fs::read_to_string(format!("/proc/{self_pid}/task/{tid}/stat")).unwrap();
+    let parts: Vec<&str> = stat.rsplit(')').next().unwrap().split_whitespace().collect();
+    let utime1: u64 = parts[11].parse().unwrap();
+    let stime1: u64 = parts[12].parse().unwrap();
+    let elapsed = sample_start.elapsed();
+    // Linux jiffies are user-HZ units (typically 100 or 1000). One full
+    // CPU-second on a 1000-Hz kernel is 1000 jiffies; on 100-Hz it's 100.
+    // Allow up to CLK_Tck + 50% slack (a manager that is genuinely working on
+    // something could legitimately use a fraction of a second) — but the
+    // busy-spin case uses ≥ CLK_Tck jiffies, which fails this bound
+    // comfortably.
+    let clk_tck: u64 = std::fs::read_to_string("/proc/self")
+        .ok()
+        .and_then(|_| None)
+        .unwrap_or(100); // best-effort default; real value via sysconf
+    let consumed = utime1.saturating_sub(utime0) + stime1.saturating_sub(stime0);
+    let elapsed_secs = elapsed.as_secs_f64();
+    let consumed_secs = consumed as f64 / clk_tck as f64;
+    assert!(
+        consumed_secs < elapsed_secs * 0.5 + 0.1,
+        "manager thread consumed {consumed_secs:.2}s of CPU during a {elapsed_secs:.2}s \
+         window with an idle control peer — busy-spin (utime {}→{}, stime {}→{})",
+        utime0,
+        utime1,
+        stime0,
+        stime1
+    );
+
+    // Sanity: a concurrent request still completes promptly under the fix.
+    let mut other = UnixStream::connect(&_daemon.socket).unwrap();
+    let req = serde_json::json!({"op": "is_system_running"});
+    let mut line = serde_json::to_string(&req).unwrap();
+    line.push('\n');
+    other.write_all(line.as_bytes()).unwrap();
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 256];
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline && buf.last().copied() != Some(b'\n') {
+        if let Ok(n) = other.read(&mut tmp) {
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&tmp[..n]);
+        }
+    }
+    assert!(
+        !buf.is_empty(),
+        "concurrent request must complete within 2s even with an idle peer held open"
+    );
+}

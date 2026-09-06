@@ -810,6 +810,30 @@ impl Manager {
         let mut out = serde_json::to_string(&resp).unwrap_or_else(|_| "{}".into());
         out.push('\n');
 
+        // Bound the response we keep resident per client: a slow or stalled
+        // peer can otherwise hold an arbitrarily large JSON payload (think
+        // `list-units` against thousands of units) in manager memory until
+        // it finishes reading. 1 MiB is well above any realistic single
+        // response; the cap turns pathological peers into dropped clients.
+        const MAX_PENDING_RESPONSE: usize = 1024 * 1024;
+        let out = if out.len() > MAX_PENDING_RESPONSE {
+            // Over-cap: tell the peer with a small error payload instead of
+            // keeping the giant one, and drop the client.
+            let truncated = serde_json::json!({
+                "ok": false,
+                "error": format!(
+                    "response truncated: {} bytes exceeded cap {}",
+                    out.len(),
+                    MAX_PENDING_RESPONSE
+                ),
+            });
+            let mut t = serde_json::to_string(&truncated).unwrap_or_else(|_| "{}".into());
+            t.push('\n');
+            t.into_bytes()
+        } else {
+            out.into_bytes()
+        };
+
         // Re-register the client in write mode and deliver the response via
         // `POLLOUT`, so a slow or non-reading peer never blocks the loop.
         self.control_clients.insert(
@@ -817,7 +841,7 @@ impl Manager {
             PendingClient {
                 stream: client.stream,
                 buffer: Vec::new(),
-                out: Some(out.into_bytes()),
+                out: Some(out),
             },
         );
         self.flush_control_response(fd);
@@ -2731,6 +2755,12 @@ impl Manager {
         if let Some(ts) = lim
             && let Some(d) = ts.as_duration()
         {
+            // Drop any prior StartTimeout for this unit. Without this, a stop →
+            // re-start cycle leaks the previous start's deadline into the wheel;
+            // `fire_service_timer` would no-op it (the state guard catches the
+            // wrong unit state), but the heap grows without bound and the
+            // manager pays an O(log n) cost per fire for nothing.
+            self.wheel.cancel_by_kind(name, TimerKind::StartTimeout);
             self.wheel
                 .schedule(Instant::now() + d, TimerKind::StartTimeout, name);
         }
@@ -2741,6 +2771,9 @@ impl Manager {
         if let Some(ts) = lim
             && let Some(d) = ts.as_duration()
         {
+            // Same idempotence as `arm_start_timeout` — keep one live deadline
+            // per (unit, kind) so a re-arming stop does not pile entries up.
+            self.wheel.cancel_by_kind(name, TimerKind::StopTimeout);
             self.wheel
                 .schedule(Instant::now() + d, TimerKind::StopTimeout, name);
         }
@@ -3163,7 +3196,17 @@ impl Manager {
             #[cfg(all(target_os = "linux", feature = "udev"))]
             let has_udev = self.udev.is_some();
             let out_ids: Vec<RawFd> = self.out_fds.keys().copied().collect();
-            let control_ids: Vec<RawFd> = self.control_clients.keys().copied().collect();
+            // Pair each control fd with whether it has a pending response.
+            // POLLOUT is only registered for those — UNIX stream sockets are
+            // always POLLOUT-ready while the send buffer has room, so
+            // registering it for read-mode clients causes `poll()` to return
+            // immediately and burns a full core as long as a peer sits
+            // connected-but-quiet (busy-spin defeating the 1s MAX_POLL_MS).
+            let control_ids: Vec<(RawFd, bool)> = self
+                .control_clients
+                .iter()
+                .map(|(fd, c)| (*fd, c.out.is_some()))
+                .collect();
             // Socket activation: poll a listener only while its target service
             // is Inactive, so a connection triggers the service once (and a
             // running/failed service keeps the fd out of the poll set).
@@ -3212,11 +3255,13 @@ impl Manager {
                     nix::poll::PollFlags::POLLIN,
                 ));
             }
-            for &fd in &control_ids {
-                pfds.push(nix::poll::PollFd::new(
-                    borrowed_fd(fd),
-                    nix::poll::PollFlags::POLLIN | nix::poll::PollFlags::POLLOUT,
-                ));
+            for &(fd, wants_write) in &control_ids {
+                let flags = if wants_write {
+                    nix::poll::PollFlags::POLLIN | nix::poll::PollFlags::POLLOUT
+                } else {
+                    nix::poll::PollFlags::POLLIN
+                };
+                pfds.push(nix::poll::PollFd::new(borrowed_fd(fd), flags));
             }
             #[cfg(all(target_os = "linux", feature = "udev"))]
             if let Some(m) = &self.udev {
@@ -3287,11 +3332,11 @@ impl Manager {
                 .collect();
             let control_ready: Vec<(RawFd, bool, bool)> = control_ids
                 .iter()
-                .map(|fd| {
+                .map(|&(fd, _wants_write)| {
                     let rev = pfds[idx].revents().unwrap_or(nix::poll::PollFlags::empty());
                     idx += 1;
                     (
-                        *fd,
+                        fd,
                         rev.contains(nix::poll::PollFlags::POLLIN),
                         rev.contains(nix::poll::PollFlags::POLLOUT),
                     )
@@ -3443,33 +3488,37 @@ impl Manager {
         };
         // Bound concurrent clients so slow or stalled peers cannot exhaust
         // manager file descriptors or memory. Excess accepts are dropped.
+        //
+        // Re-check the cap inside the loop: with a kernel backlog of queued
+        // connections the accept loop can otherwise keep growing the map
+        // past `MAX_CONCURRENT_CLIENTS` for every iteration before EWOULDBLOCK.
         const MAX_CONCURRENT_CLIENTS: usize = 1024;
-        let at_cap = self.control_clients.len() >= MAX_CONCURRENT_CLIENTS;
         while let Ok((stream, _)) = listener.accept() {
-            // Never read a control request inline: a peer that connects and
-            // sends nothing must not stall the event loop. Register the socket
-            // non-blockingly and drain it on future poll iterations.
-            if at_cap || stream.set_nonblocking(true).is_err() {
+            if self.control_clients.len() >= MAX_CONCURRENT_CLIENTS
+                || stream.set_nonblocking(true).is_err()
+            {
                 continue;
             }
             // Only the manager's own UID may issue control requests. This is
             // the authoritative gate; the owner-only socket mode is defense
             // in depth. A system manager (root) accepts only root; a user
-            // manager accepts only its owner.
-            if let Some(uid) = crate::platform::net::peer_uid(&stream)
-                && uid != self.cfg.uid
-            {
-                continue;
+            // manager accepts only its owner. A peer whose UID cannot be
+            // resolved (kernel without `SO_PEERCRED`, transient error at
+            // accept time) is rejected — fail closed, not open.
+            match crate::platform::net::peer_uid(&stream) {
+                Some(uid) if uid == self.cfg.uid => {
+                    let fd = stream.as_raw_fd();
+                    self.control_clients.insert(
+                        fd,
+                        PendingClient {
+                            stream,
+                            buffer: Vec::new(),
+                            out: None,
+                        },
+                    );
+                }
+                _ => continue,
             }
-            let fd = stream.as_raw_fd();
-            self.control_clients.insert(
-                fd,
-                PendingClient {
-                    stream,
-                    buffer: Vec::new(),
-                    out: None,
-                },
-            );
         }
     }
 

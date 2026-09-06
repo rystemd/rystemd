@@ -99,27 +99,30 @@ impl Daemon {
 
     fn start_impl(dbus: bool) -> Daemon {
         let socket = std::env::var_os("RYSTEMD_SOCKET").unwrap().into();
-        let handle = std::thread::spawn(move || {
-            let mut mgr = rystemd::manager::Manager::new(
-                rystemd::manager::ManagerCfg::for_mode(false).unwrap(),
-            )
+        let handle = std::thread::Builder::new()
+            .name("rystemd-manager".into())
+            .spawn(move || {
+                let mut mgr = rystemd::manager::Manager::new(
+                    rystemd::manager::ManagerCfg::for_mode(false).unwrap(),
+                )
+                .unwrap();
+                mgr.load_all();
+                // Mirror the real daemon (daemon.rs::run_daemon_with_ready):
+                // enumerate kernel devices before serving requests.
+                #[cfg(all(target_os = "linux", feature = "udev"))]
+                mgr.udev_init();
+                if dbus {
+                    // Best-effort: an absent/unreachable bus is logged and the
+                    // manager keeps running without D-Bus.
+                    #[cfg(all(target_os = "linux", feature = "dbus"))]
+                    mgr.start_dbus().ok();
+                }
+                mgr.bind_ipc().unwrap();
+                mgr.bind_notify().ok();
+                mgr.setup_signals();
+                mgr.run();
+            })
             .unwrap();
-            mgr.load_all();
-            // Mirror the real daemon (daemon.rs::run_daemon_with_ready):
-            // enumerate kernel devices before serving requests.
-            #[cfg(all(target_os = "linux", feature = "udev"))]
-            mgr.udev_init();
-            if dbus {
-                // Best-effort: an absent/unreachable bus is logged and the
-                // manager keeps running without D-Bus.
-                #[cfg(all(target_os = "linux", feature = "dbus"))]
-                mgr.start_dbus().ok();
-            }
-            mgr.bind_ipc().unwrap();
-            mgr.bind_notify().ok();
-            mgr.setup_signals();
-            mgr.run();
-        });
         Daemon {
             handle: Some(handle),
             socket,

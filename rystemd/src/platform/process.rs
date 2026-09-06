@@ -207,7 +207,14 @@ pub fn spawn(opts: &SpawnOptions) -> std::io::Result<Spawned> {
 
     let uid = opts.uid;
     let gid = opts.gid;
-    let groups = opts.groups.clone();
+    // Pre-collect the `Gid` array for `setgroups` so the closure body is a
+    // single `&[]` borrow — no `Vec::collect` allocation in pre_exec, which
+    // can deadlock on libc's malloc mutex from a multithreaded parent.
+    let gids: Vec<Gid> = opts
+        .groups
+        .iter()
+        .map(|&g| Gid::from_raw(g))
+        .collect();
     let umaskv = opts.umask;
     let nice = opts.nice;
     let rlimits = opts.rlimits.clone();
@@ -309,9 +316,8 @@ pub fn spawn(opts: &SpawnOptions) -> std::io::Result<Spawned> {
             {
                 return Err(std::io::Error::from(e));
             }
-            if !groups.is_empty()
-                && let Err(e) =
-                    setgroups(&groups.iter().map(|&g| Gid::from_raw(g)).collect::<Vec<_>>())
+            if !gids.is_empty()
+                && let Err(e) = setgroups(&gids)
             {
                 return Err(std::io::Error::from(e));
             }
