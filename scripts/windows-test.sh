@@ -52,7 +52,8 @@ Options
   --iso PATH          Windows 11 ISO (build-image only)
   --virtio-win PATH   virtio-win driver ISO (build-image only)
   --mem MB              VM memory in MiB (default 4096)
-  --watch PORT          build-image: expose a live VNC display on 127.0.0.1:PORT
+  --watch PORT          build-image: run a live VNC viewer bound to 127.0.0.1:PORT
+                        (must be >= 5900; QEMU's VNC shorthand otherwise mis-binds)
   --edition NAME        install.wim edition name (default 'Windows 11 Pro'; check
                         with: smolvm or wimlib-imagex -info <iso>/sources/install.wim)
 
@@ -135,24 +136,34 @@ cmd_build_image() {
 import sys
 import smolvm.vm as vm_mod
 
-iso, vk, out, user, pw, port, edition = sys.argv[1:8]
-port = str(int(port))
+iso, vk, out, user, pw, tcp_port, edition = sys.argv[1:8]
+
+# QEMU VNC treats the number after the host as a DISPLAY, not a TCP port:
+# vnc=host:5901 listens on 5900+5901 = 11801. We accept the user's actual TCP
+# port and derive the display number (port - 5900). A real VNC viewer connects
+# to the TCP port the user asked for.
+port = int(tcp_port)
+display = port - 5900
+if display < 0:
+    sys.exit(f"error: --watch PORT must be >= 5900 (got {port})")
+vnc_arg = f"vnc=127.0.0.1:{display}"
 
 _orig = vm_mod.build_qemu_argv
 def _patched(*a, **k):
     argv = _orig(*a, **k)
     # Swap the headless display for a VNC one (bind loopback; the viewer
-    # connects to 127.0.0.1:<port>). VNC lets us watch the unattended GUI.
+    # connects to 127.0.0.1:<tcp_port>). VNC lets us watch the unattended GUI.
     try:
         i = argv.index("-nographic")
         argv[i] = "-display"
-        argv.insert(i + 1, f"vnc=127.0.0.1:{port}")
+        argv.insert(i + 1, vnc_arg)
     except ValueError:
         pass
     return argv
 vm_mod.build_qemu_argv = _patched
 
 from smolvm.windows.build_image import WindowsImageBuilder
+print(f"==> VNC listening on 127.0.0.1:{port} (display {display})")
 WindowsImageBuilder(
     windows_iso=iso, virtio_win_iso=vk, output_qcow2=out,
     username=user, password=pw, edition=edition,
