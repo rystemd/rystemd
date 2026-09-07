@@ -151,14 +151,23 @@ vnc_arg = f"vnc=127.0.0.1:{display}"
 _orig = vm_mod.build_qemu_argv
 def _patched(*a, **k):
     argv = _orig(*a, **k)
-    # Swap the headless display for a VNC one (bind loopback; the viewer
-    # connects to 127.0.0.1:<tcp_port>). VNC lets us watch the unattended GUI.
+    # 1. Swap the headless display for a VNC one (bind loopback; the viewer
+    #    connects to 127.0.0.1:<tcp_port>). VNC lets us watch the unattended GUI.
     try:
         i = argv.index("-nographic")
         argv[i] = "-display"
         argv.insert(i + 1, vnc_arg)
     except ValueError:
         pass
+    # 2. Force OVMF to boot the Windows ISO first via UEFI (no eltorito
+    #    "Press any key" prompt, no PXE fallthrough). The Windows install
+    #    ISO is the first extra drive (extra0-drive). Give its ide-cd an
+    #    explicit bootindex so firmware boot order is deterministic.
+    for j, a in enumerate(argv):
+        if a == "-device" and f"drive=extra0-drive" in argv[j + 1]:
+            dev = argv[j + 1]
+            if ",bootindex=" not in dev:
+                argv[j + 1] = f"{dev},bootindex=0"
     return argv
 vm_mod.build_qemu_argv = _patched
 
