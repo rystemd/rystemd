@@ -32,6 +32,8 @@ DEFAULT_IMAGE="$SMOLVM_IMAGE_DIR/win11.qcow2"
 SSH_USER="${SMOLVM_SSH_USER:-Administrator}"
 SSH_PASSWORD="${SMOLVM_SSH_PASSWORD:-}"
 MEM_MB="${SMOLVM_MEM_MB:-4096}"
+EDITION="${SMOLVM_EDITION:-Windows 11 Pro}"
+WATCH_VNC=""
 
 usage() {
   cat <<'EOF'
@@ -49,7 +51,10 @@ Options
   --password PASS     Windows account password
   --iso PATH          Windows 11 ISO (build-image only)
   --virtio-win PATH   virtio-win driver ISO (build-image only)
-  --mem MB            VM memory in MiB (default 4096)
+  --mem MB              VM memory in MiB (default 4096)
+  --watch PORT          build-image: expose a live VNC display on 127.0.0.1:PORT
+  --edition NAME        install.wim edition name (default 'Windows 11 Pro'; check
+                        with: smolvm or wimlib-imagex -info <iso>/sources/install.wim)
 
 check-msvc runs entirely on the Linux host and needs no VM.
 test / build-image need a Windows image; build-image needs --iso and --virtio-win.
@@ -108,16 +113,57 @@ cmd_build_image() {
   ensure_smolvm
   : "${ISO:?build-image requires --iso PATH}"
   : "${VIRTIO_WIN:?build-image requires --virtio-win PATH}"
+  # Refuse a not-yet-downloaded ISO (0 bytes is a non-starter that would
+  # otherwise burn a 45-min VM build on an empty install source).
+  if [ ! -s "$ISO" ]; then
+    echo "error: --iso '$ISO' is empty (0 bytes) — finish the download first" >&2
+    exit 2
+  fi
   local out="${IMAGE:-$DEFAULT_IMAGE}"
   mkdir -p "$(dirname "$out")"
   if [ -f "$out" ]; then
     echo "==> image already exists: $out (refusing to overwrite; --output is guarded by smolvm)" >&2
     exit 1
   fi
+  if [ -n "$WATCH_VNC" ]; then
+    # Run the build with a live VNC display instead of smolvm's headless
+    # -nographic so the user can watch the install. Non-destructive: a thin
+    # wrapper monkeypatches smolvm.vm.build_qemu_argv to swap the display arg
+    # for this invocation only; nothing in the venv is modified.
+    echo "==> building with live VNC on 127.0.0.1:$WATCH_VNC (connect a VNC viewer; Ctrl+C to abort)" >&2
+    exec "$SMOLVM_VENV/bin/python" - "$ISO" "$VIRTIO_WIN" "$out" "$SSH_USER" "$SSH_PASSWORD" "$WATCH_VNC" "$EDITION" <<'PYEOF'
+import sys
+import smolvm.vm as vm_mod
+
+iso, vk, out, user, pw, port, edition = sys.argv[1:8]
+port = str(int(port))
+
+_orig = vm_mod.build_qemu_argv
+def _patched(*a, **k):
+    argv = _orig(*a, **k)
+    # Swap the headless display for a VNC one (bind loopback; the viewer
+    # connects to 127.0.0.1:<port>). VNC lets us watch the unattended GUI.
+    try:
+        i = argv.index("-nographic")
+        argv[i] = "-display"
+        argv.insert(i + 1, f"vnc=127.0.0.1:{port}")
+    except ValueError:
+        pass
+    return argv
+vm_mod.build_qemu_argv = _patched
+
+from smolvm.windows.build_image import WindowsImageBuilder
+WindowsImageBuilder(
+    windows_iso=iso, virtio_win_iso=vk, output_qcow2=out,
+    username=user, password=pw, edition=edition,
+).build()
+PYEOF
+  fi
   echo "==> building Windows image (15-30 min unattended) -> $out" >&2
   exec "$SMOLVM_VENV/bin/smolvm" windows build-image \
     --iso "$ISO" --virtio-win-iso "$VIRTIO_WIN" \
     --username "$SSH_USER" --password "$SSH_PASSWORD" \
+    --edition "$EDITION" \
     --output "$out"
 }
 
@@ -177,6 +223,8 @@ while [ $# -gt 0 ]; do
     --iso) ISO="$2"; shift 2 ;;
     --virtio-win) VIRTIO_WIN="$2"; shift 2 ;;
     --mem) MEM_MB="$2"; shift 2 ;;
+    --watch) WATCH_VNC="$2"; shift 2 ;;
+    --edition) EDITION="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown arg: $1" >&2; usage; exit 2 ;;
   esac
