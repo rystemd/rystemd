@@ -53,6 +53,12 @@ Options
 
 check-msvc runs entirely on the Linux host and needs no VM.
 test / build-image need a Windows image; build-image needs --iso and --virtio-win.
+
+The Windows 11 ISO is a legal download from Microsoft and must be obtained by
+the user (this script does not fetch it): https://www.microsoft.com/en-
+ca/software-download/windows11 — on this host an image is cached OUTSIDE the
+repo under ~/.smolvm/images/ (transient, deletable). The virtio-win driver
+ISO (~877 MB) is fetched by this script from fedorapeople.org if not present.
 EOF
 }
 
@@ -102,16 +108,17 @@ cmd_build_image() {
   ensure_smolvm
   : "${ISO:?build-image requires --iso PATH}"
   : "${VIRTIO_WIN:?build-image requires --virtio-win PATH}"
-  mkdir -p "$SMOLVM_IMAGE_DIR"
-  if [ -s "$IMAGE" ]; then
-    echo "==> image already exists: $IMAGE (refusing to overwrite; --output is guarded by smolvm)" >&2
+  local out="${IMAGE:-$DEFAULT_IMAGE}"
+  mkdir -p "$(dirname "$out")"
+  if [ -f "$out" ]; then
+    echo "==> image already exists: $out (refusing to overwrite; --output is guarded by smolvm)" >&2
     exit 1
   fi
-  echo "==> building Windows image (15-30 min unattended) -> $IMAGE" >&2
+  echo "==> building Windows image (15-30 min unattended) -> $out" >&2
   exec "$SMOLVM_VENV/bin/smolvm" windows build-image \
     --iso "$ISO" --virtio-win-iso "$VIRTIO_WIN" \
     --username "$SSH_USER" --password "$SSH_PASSWORD" \
-    --output "$IMAGE"
+    --output "$out"
 }
 
 # ---- boot a Windows sandbox and run native tests ----------------------------
