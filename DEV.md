@@ -51,7 +51,7 @@ getty setup, and power control.
 | `scripts/vm-test.sh` | Automated QEMU boot test |
 | `scripts/live-vm.sh` | Interactive PID 1 VM |
 | `scripts/run-systemd-test.sh` | Alpine compatibility scenario runner |
-| `scripts/windows-test.sh` | smolvm Windows cross-check / sandbox test (see below) |
+| `.github/workflows/ci.yml` | Push/PR CI: test, privileged, Windows lint+test+build (no publish) |
 
 Standard gates:
 
@@ -117,42 +117,21 @@ cargo check --workspace --locked --target x86_64-pc-windows-msvc
 Musl release builds use the pinned Alpine sysroot scripts. GNU Linux builds
 serve Fedora and Debian package lanes. Windows runtime tests require Windows.
 
-### Writing and testing Windows code on a Linux host (smolvm)
+### Writing and testing Windows code (CI, not local emulation)
 
 A Linux dev host cannot link or run the native `x86_64-pc-windows-msvc`
-target (it needs Windows' `link.exe` / a running Windows). Two wrappers in
-[`scripts/windows-test.sh`](scripts/windows-test.sh) cover the workflows:
+target (it needs Windows' `link.exe` / a running Windows). Windows
+verification is done in the **real-Windows CI pipeline** (`.github/workflows/ci.yml`),
+which runs on every untagged branch push and PR: it lints
+(`cargo clippy --workspace --all-targets -D warnings`), runs
+`cargo test --workspace --locked`, and builds the MSVC target — without
+packaging or publishing (that is reserved for the tag-gated `release.yml`).
 
-```sh
-# Type-check + compile the cfg(windows) paths. No VM, runs on the host.
-scripts/windows-test.sh check-msvc
-
-# Boot a real Windows 11 sandbox via SmolVM and run the native Windows
-# test suite inside it. Needs a Windows qcow2 (see below).
-scripts/windows-test.sh test --image /path/to/win11.qcow2 --password '<acct-pass>'
-```
-
-The full `test` path is for when Windows verification is explicitly required
-(issue #6, platform/windows code). It is NOT part of regular Linux builds or
-tests; CI uses a real Windows runner for the pipeline.
-
-`scripts/windows-test.sh` self-installs what it needs on first use (smolvm
-into `~/.smolvm/venv`; system prerequisites `qemu-img`, `swtpm`, and for
-`build-image` `xorriso`, via the package manager). It never modifies a
-checked-in tree and never assumes smolvm is present.
-
-A Windows 11 `qcow2` image is a large, transient artifact. Build it once,
-cached OUTSIDE the repo:
-
-```sh
-scripts/windows-test.sh build-image \
-  --iso ./Win11.iso --virtio-win ./virtio-win.iso --password '<acct-pass>'
-```
-
-This runs a 15-30 min unattended Windows install and writes
-`~/.smolvm/images/win11.qcow2` (or `--image`). The image must contain
-OpenSSH Server, rustup, and the MSVC toolchain for `test` to work. The
-golden image is booted read-only; SmolVM stacks a per-VM overlay.
+So the workflow for platform/windows changes (e.g. issue #6, the control-pipe
+security descriptor): push an untagged commit, then read the `windows` job's
+test results to confirm whether the change works or how it fails. Local QEMU
+emulation for Windows was tried and abandoned — the unattended install could
+not complete reliably — so CI is the sole source of Windows verification.
 
 ## Release procedure
 

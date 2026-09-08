@@ -81,7 +81,8 @@ not merged.
 
 ## Test coverage
 
-- No push or pull-request CI workflow exists. Release checks run on tag pushes.
+- A push/PR CI workflow runs lint, tests, and the Windows build, but does not
+  publish binaries. Release checks (with asset packaging) run on tag pushes.
 - Live PID 1 runtime behavior, root-only sandbox paths, cgroup enforcement, and
   several Windows paths require dedicated environments.
 - Parser fuzzing and calendar or timespan property testing are absent.
