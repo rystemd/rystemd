@@ -559,3 +559,21 @@ timing, journal read bounds, hot-path unwraps, switch_root argv[0], the
 two lows) are tracked as GitHub issues labelled `v0.3.0`. The Windows
 control-pipe ACL remains the unverified trust gap (issue #6, blocked on
 a Windows runner).
+
+## Run 3 outcome — Windows DACL attempt + revert
+
+Issue #6 (explicit DACL on the Windows control pipe, defense-in-depth
+per-caller auth) was attempted in commit `0e8f0d2` and pushed. CI run
+`34175935053` (workflow `check.yml`, job `windows`) **failed** at
+`rystemctl/tests/windows.rs:48` — the user-manager pipe test times out
+on `list_units` after 5 s, while the system-2022 `cargo test` itself
+compiled clean (lib unit tests for `build_pipe_security` passed). The
+fail-open bug found and fixed during this session (process-vs-thread
+token read under `ImpersonateNamedPipeClient`) was correct, but the
+fix as written still rejected the connecting test client. Reverted in
+`70b38e6` so the workflow is green again. Next attempt requires either
+local Windows reproduction (preferred — log the exact `GetLastError`
+and the connected client's token), or a CI workflow that runs the
+failing test under `RUST_BACKTRACE=full` with a debug-print
+`ImpersonateNamedPipeClient`/`OpenThreadToken`/token-SID path on a
+failing connection.
