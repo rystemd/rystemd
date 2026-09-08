@@ -728,7 +728,7 @@ impl Manager {
 
     pub fn bind_ipc(&mut self) -> Result<(), String> {
         let path = self.control_socket_path();
-        self.listener = Some(crate::platform::net::bind_control(&path, self.cfg.user)?);
+        self.listener = Some(crate::platform::net::bind_control(&path)?);
         Ok(())
     }
 

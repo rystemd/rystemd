@@ -251,8 +251,8 @@ fn one_tcp_connection_triggers_oneshot_only_once() {
 #[test]
 fn named_pipe_bind_rejects_an_existing_endpoint() {
     let scratch = Scratch::new();
-    let first = rystemd::platform::net::bind_control(&scratch.pipe, true).unwrap();
-    let second = rystemd::platform::net::bind_control(&scratch.pipe, true);
+    let first = rystemd::platform::net::bind_control(&scratch.pipe).unwrap();
+    let second = rystemd::platform::net::bind_control(&scratch.pipe);
     assert!(
         second.is_err(),
         "a second manager must not claim the same pipe"

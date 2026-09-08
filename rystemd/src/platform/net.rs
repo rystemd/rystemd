@@ -10,12 +10,7 @@ use serde_json::Value;
 /// Bind (and rebind) a stream listener for the control channel. Non-blocking:
 /// the event loop drives `accept()` via `poll`, so a blocking accept would
 /// stall the whole manager.
-///
-/// `user` selects which control planes are permitted. On Unix the owner-only
-/// mode is already sufficient (the manager gates every peer by `SO_PEERCRED`
-/// against its own UID), so `user` is accepted for signature parity with the
-/// Windows implementation and not otherwise consulted here.
-pub fn bind_control(path: &Path, _user: bool) -> Result<UnixListener, String> {
+pub fn bind_control(path: &Path) -> Result<UnixListener, String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
@@ -113,7 +108,7 @@ mod tests {
         unsafe {
             libc::umask(0);
         }
-        let listener = bind_control(&sock, false).unwrap();
+        let listener = bind_control(&sock).unwrap();
         unsafe {
             libc::umask(0o022);
         }
