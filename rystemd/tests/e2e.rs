@@ -1257,7 +1257,12 @@ fn idle_control_client_does_not_busy_spin_event_loop() {
     let stat0 = std::fs::read_to_string(format!("/proc/{self_pid}/task/{tid}/stat")).unwrap();
     // field 14 = utime, field 15 = stime (1-indexed). The first field is the
     // `comm` in parentheses and may contain spaces, so split from the right.
-    let parts0: Vec<&str> = stat0.rsplit(')').next().unwrap().split_whitespace().collect();
+    let parts0: Vec<&str> = stat0
+        .rsplit(')')
+        .next()
+        .unwrap()
+        .split_whitespace()
+        .collect();
     assert!(parts0.len() >= 15, "unexpected /proc stat layout");
     let utime0: u64 = parts0[11].parse().unwrap();
     let stime0: u64 = parts0[12].parse().unwrap();
@@ -1269,7 +1274,12 @@ fn idle_control_client_does_not_busy_spin_event_loop() {
     std::thread::sleep(Duration::from_secs(1));
 
     let stat = std::fs::read_to_string(format!("/proc/{self_pid}/task/{tid}/stat")).unwrap();
-    let parts: Vec<&str> = stat.rsplit(')').next().unwrap().split_whitespace().collect();
+    let parts: Vec<&str> = stat
+        .rsplit(')')
+        .next()
+        .unwrap()
+        .split_whitespace()
+        .collect();
     let utime1: u64 = parts[11].parse().unwrap();
     let stime1: u64 = parts[12].parse().unwrap();
     let elapsed = sample_start.elapsed();
@@ -1279,10 +1289,10 @@ fn idle_control_client_does_not_busy_spin_event_loop() {
     // something could legitimately use a fraction of a second) — but the
     // busy-spin case uses ≥ CLK_Tck jiffies, which fails this bound
     // comfortably.
-    let clk_tck: u64 = std::fs::read_to_string("/proc/self")
-        .ok()
-        .and_then(|_| None)
-        .unwrap_or(100); // best-effort default; real value via sysconf
+    // CLK_TCK is user-HZ: the number of jiffies per wall-second. Read it via
+    // sysconf(_SC_CLK_TCK) so the jiffy→seconds conversion is exact on any
+    // kernel (typically 100 or 1000).
+    let clk_tck: u64 = unsafe { (libc::sysconf(libc::_SC_CLK_TCK)) as u64 }.max(1);
     let consumed = utime1.saturating_sub(utime0) + stime1.saturating_sub(stime0);
     let elapsed_secs = elapsed.as_secs_f64();
     let consumed_secs = consumed as f64 / clk_tck as f64;

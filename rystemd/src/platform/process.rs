@@ -210,11 +210,7 @@ pub fn spawn(opts: &SpawnOptions) -> std::io::Result<Spawned> {
     // Pre-collect the `Gid` array for `setgroups` so the closure body is a
     // single `&[]` borrow — no `Vec::collect` allocation in pre_exec, which
     // can deadlock on libc's malloc mutex from a multithreaded parent.
-    let gids: Vec<Gid> = opts
-        .groups
-        .iter()
-        .map(|&g| Gid::from_raw(g))
-        .collect();
+    let gids: Vec<Gid> = opts.groups.iter().map(|&g| Gid::from_raw(g)).collect();
     let umaskv = opts.umask;
     let nice = opts.nice;
     let rlimits = opts.rlimits.clone();
