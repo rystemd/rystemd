@@ -1,0 +1,58 @@
+name: check
+
+# Push-triggered test workflow (NOT tag-gated). Runs the test suite and the
+# native Windows build/tests on every branch push and pull request, but never
+# packages or publishes binaries — that is reserved for the tag-triggered
+# release workflow (.github/workflows/release.yml). This gives developers real
+# Windows CI results for platform/windows changes without cutting a release.
+#
+# Rationale: Windows runtime verification (control-pipe security descriptor,
+# SCM dispatcher, rystemd/tests/windows.rs) requires a real Windows runner,
+# which cannot be reproduced locally on a Linux dev host. Pushing an untagged
+# commit now surfaces those results in CI.
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # dbus-daemon, for the D-Bus integration test (tests/dbus.rs).
+      - run: sudo apt-get update && sudo apt-get install -y dbus
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace
+      # Privileged tests self-skip when not root. Build+run prebuilt binary as
+      # real root (sudo, not a namespace — need an unmapped uid for User=).
+      - run: cargo test -p rystemd --test privileged --no-run
+      - run: sudo "$(find target/debug/deps -maxdepth 1 -name 'privileged-*' -type f -executable -print -quit)"
+
+  windows:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      # Pin the declared workspace MSRV so stable upgrades cannot hide a newer
+      # language or standard-library requirement.
+      - uses: dtolnay/rust-toolchain@1.89.0
+        with:
+          targets: x86_64-pc-windows-msvc
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Lint native Windows workspace at MSRV
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Test native Windows workspace at MSRV
+        run: cargo test --workspace --locked
+      - name: Build native Windows workspace at MSRV
+        run: cargo build --workspace --locked --target x86_64-pc-windows-msvc

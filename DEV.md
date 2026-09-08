@@ -51,7 +51,7 @@ getty setup, and power control.
 | `scripts/vm-test.sh` | Automated QEMU boot test |
 | `scripts/live-vm.sh` | Interactive PID 1 VM |
 | `scripts/run-systemd-test.sh` | Alpine compatibility scenario runner |
-| `.github/workflows/ci.yml` | Push/PR CI: test, privileged, Windows lint+test+build (no publish) |
+| `.github/workflows/check.yml` | Push/PR CI: test, privileged, Windows lint+test+build (no publish) |
 
 Standard gates:
 
@@ -120,18 +120,26 @@ serve Fedora and Debian package lanes. Windows runtime tests require Windows.
 ### Writing and testing Windows code (CI, not local emulation)
 
 A Linux dev host cannot link or run the native `x86_64-pc-windows-msvc`
-target (it needs Windows' `link.exe` / a running Windows). Windows
-verification is done in the **real-Windows CI pipeline** (`.github/workflows/ci.yml`),
+target (it needs Windows' `link.exe` / a running Windows). Verification is
+done in the **real-Windows CI pipeline** (`.github/workflows/check.yml`),
 which runs on every untagged branch push and PR: it lints
 (`cargo clippy --workspace --all-targets -D warnings`), runs
 `cargo test --workspace --locked`, and builds the MSVC target — without
 packaging or publishing (that is reserved for the tag-gated `release.yml`).
 
+The same three commands are exactly what a developer runs locally on a
+Windows box (`cargo clippy`, `cargo test`, `cargo build` for
+`x86_64-pc-windows-msvc`), so anyone with Windows can reproduce the `windows`
+job without a specially-built environment. CI pins the toolchain to the MSRV
+(1.89.0); locally, use the same toolchain to avoid version drift hiding a
+regression.
+
 So the workflow for platform/windows changes (e.g. issue #6, the control-pipe
-security descriptor): push an untagged commit, then read the `windows` job's
-test results to confirm whether the change works or how it fails. Local QEMU
-emulation for Windows was tried and abandoned — the unattended install could
-not complete reliably — so CI is the sole source of Windows verification.
+security descriptor): run the three commands on a Windows box, or push an
+untagged commit and read the `windows` job's test results to confirm whether
+the change works or how it fails. Local QEMU emulation for Windows was tried
+and abandoned — the unattended install could not complete reliably — so CI
+is the primary source of Windows verification.
 
 ## Release procedure
 
